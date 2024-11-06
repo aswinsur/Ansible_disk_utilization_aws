@@ -1,0 +1,94 @@
+- name: Fetch disk utilization from EC2 instances across multiple AWS accounts
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /Users/aswinsur/.local/pipx/venvs/ansible/bin/python
+    accounts:
+      - name: Account1
+        role_arn: arn:aws:iam::111111111111:role/CrossAccountRole
+        region: us-west-2
+      - name: Account2
+        role_arn: arn:aws:iam::222222222222:role/CrossAccountRole
+        region: us-east-1
+      - name: Account3
+        role_arn: arn:aws:iam::333333333333:role/CrossAccountRole
+        region: eu-west-1
+    results: []
+    s3_bucket: your-s3-bucket-name
+    s3_object_key: disk_utilization_report.csv
+
+  tasks:
+    - name: Process each AWS account
+      loop: "{{ accounts }}"
+      loop_control:
+        loop_var: account
+      block:
+        - name: Assume role for {{ account.name }}
+          community.aws.sts_assume_role:
+            role_arn: "{{ account.role_arn }}"
+            role_session_name: "DiskUtilizationSession"
+          register: assumed_role
+
+        - name: Get EC2 instances for {{ account.name }}
+          amazon.aws.ec2_instance_info:
+            region: "{{ account.region }}"
+          register: ec2_instances
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ assumed_role.sts_creds.session_token }}"
+
+        - name: Get disk utilization for each instance in {{ account.name }}
+          ansible.builtin.command:
+            cmd: >
+              aws cloudwatch get-metric-statistics
+              --region {{ account.region }}
+              --namespace AWS/EBS
+              --metric-name VolumeReadBytes
+              --dimensions Name=VolumeId,Value={{ item.block_device_mappings[0].ebs.volume_id }}
+              --start-time {{ (ansible_date_time.iso8601 | to_datetime - '1 hour') | to_iso8601_date_time }}
+              --end-time {{ ansible_date_time.iso8601 }}
+              --period 3600
+              --statistics Sum
+              --query 'Datapoints[0].Sum'
+              --output text
+          loop: "{{ ec2_instances.instances }}"
+          register: disk_utilization
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ assumed_role.sts_creds.access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ assumed_role.sts_creds.secret_key }}"
+            AWS_SESSION_TOKEN: "{{ assumed_role.sts_creds.session_token }}"
+
+        - name: Aggregate results for {{ account.name }}
+          set_fact:
+            results: "{{ results + [{'account': account.name, 'instance': item.0, 'utilization': item.1.stdout}] }}"
+          loop: "{{ ec2_instances.instances | zip(disk_utilization.results) | list }}"
+
+    - name: Create CSV content
+      set_fact:
+        csv_content: |
+          Account,Instance ID,Volume ID,Disk Utilization (bytes read in last hour)
+          {% for item in results %}
+          {{ item.account }},{{ item.instance.instance_id }},{{ item.instance.block_device_mappings[0].ebs.volume_id }},{{ item.utilization | default('N/A') }}
+          {% endfor %}
+
+    - name: Display aggregated results
+      debug:
+        msg: "Account: {{ item.account }}, Instance ID: {{ item.instance.instance_id }}, Volume ID: {{ item.instance.block_device_mappings[0].ebs.volume_id }}, Disk Utilization: {{ item.utilization | default('N/A') }} bytes read in last hour"
+      loop: "{{ results }}"
+
+    - name: Save results to S3
+      amazon.aws.aws_s3:
+        bucket: "{{ s3_bucket }}"
+        object: "{{ s3_object_key }}"
+        content: "{{ csv_content }}"
+        mode: put
+        permission: private
+      register: s3_upload_result
+
+    - name: Display S3 upload result
+      debug:
+        msg: "Report uploaded to S3: {{ s3_upload_result.url }}"
+
+
+
